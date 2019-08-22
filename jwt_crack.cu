@@ -77,44 +77,135 @@ __device__ void sha256_init(uint32_t state[8]) {
     state[4] = 0x510e527f; state[5] = 0x9b05688c; state[6] = 0x1f83d9ab; state[7] = 0x5be0cd19;
 }
 
-// Simple HMAC-SHA256 implementation
-__device__ void hmac_sha256(const char* key, int key_len, const char* message, int msg_len, unsigned char* output) {
-    unsigned char k_ipad[64], k_opad[64];
-    int i;
+__device__ void sha256_update(uint32_t state[8], const unsigned char *data, size_t len, 
+                            unsigned char *buffer, size_t *buffer_len, uint64_t *total_len) {
+    size_t i;
+    *total_len += len;
     
-    memset(k_ipad, 0x36, 64);
-    memset(k_opad, 0x5c, 64);
-    
-    for (i = 0; i < key_len && i < 64; i++) {
-        k_ipad[i] ^= key[i];
-        k_opad[i] ^= key[i];
-    }
-    
-    // Inner hash - simplified for now
-    uint32_t state[8];
-    sha256_init(state);
-    
-    // This is a simplified version - full implementation would be more complex
-    for (i = 0; i < 8; i++) {
-        output[i*4] = (state[i] >> 24) & 0xFF;
-        output[i*4+1] = (state[i] >> 16) & 0xFF;
-        output[i*4+2] = (state[i] >> 8) & 0xFF;
-        output[i*4+3] = state[i] & 0xFF;
+    for (i = 0; i < len; i++) {
+        buffer[*buffer_len] = data[i];
+        (*buffer_len)++;
+        
+        if (*buffer_len == 64) {
+            sha256_transform(state, buffer);
+            *buffer_len = 0;
+        }
     }
 }
 
-__global__ void crack_jwt_kernel(const char* target, const char* payload, int payload_len, char* result) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    char test_key[16];
+__device__ void sha256_final(uint32_t state[8], unsigned char hash[32], 
+                           unsigned char *buffer, size_t buffer_len, uint64_t total_len) {
+    size_t i;
+    
+    buffer[buffer_len++] = 0x80;
+    
+    if (buffer_len > 56) {
+        while (buffer_len < 64) {
+            buffer[buffer_len++] = 0;
+        }
+        sha256_transform(state, buffer);
+        buffer_len = 0;
+    }
+    
+    while (buffer_len < 56) {
+        buffer[buffer_len++] = 0;
+    }
+    
+    uint64_t bit_len = total_len * 8;
+    for (int i = 0; i < 8; i++) {
+        buffer[63 - i] = (unsigned char)(bit_len >> (i * 8));
+    }
+    
+    sha256_transform(state, buffer);
+    
+    for (i = 0; i < 8; i++) {
+        hash[i * 4] = (unsigned char)(state[i] >> 24);
+        hash[i * 4 + 1] = (unsigned char)(state[i] >> 16);
+        hash[i * 4 + 2] = (unsigned char)(state[i] >> 8);
+        hash[i * 4 + 3] = (unsigned char)state[i];
+    }
+}
+
+// Improved HMAC-SHA256 implementation
+__device__ void hmac_sha256(const char* key, int key_len, const char* message, int msg_len, unsigned char* output) {
+    unsigned char k_ipad[64], k_opad[64];
+    unsigned char tk[32];
+    
+    uint32_t inner_state[8], outer_state[8];
+    unsigned char inner_buffer[64], outer_buffer[64];
+    size_t inner_buffer_len = 0, outer_buffer_len = 0;
+    uint64_t inner_total_len = 0, outer_total_len = 0;
+    
+    int i;
+    
+    // Handle key length > 64
+    if (key_len > 64) {
+        uint32_t temp_state[8];
+        unsigned char temp_buffer[64];
+        size_t temp_buffer_len = 0;
+        uint64_t temp_total_len = 0;
+        
+        sha256_init(temp_state);
+        sha256_update(temp_state, (const unsigned char*)key, key_len, temp_buffer, &temp_buffer_len, &temp_total_len);
+        sha256_final(temp_state, tk, temp_buffer, temp_buffer_len, temp_total_len);
+        
+        key = (const char*)tk;
+        key_len = 32;
+    }
+    
+    // Create padded keys
+    for (i = 0; i < 64; i++) {
+        if (i < key_len) {
+            k_ipad[i] = key[i] ^ 0x36;
+            k_opad[i] = key[i] ^ 0x5c;
+        } else {
+            k_ipad[i] = 0x36;
+            k_opad[i] = 0x5c;
+        }
+    }
+    
+    // Inner hash
+    sha256_init(inner_state);
+    sha256_update(inner_state, k_ipad, 64, inner_buffer, &inner_buffer_len, &inner_total_len);
+    sha256_update(inner_state, (const unsigned char*)message, msg_len, inner_buffer, &inner_buffer_len, &inner_total_len);
+    sha256_final(inner_state, output, inner_buffer, inner_buffer_len, inner_total_len);
+    
+    // Outer hash
+    sha256_init(outer_state);
+    sha256_update(outer_state, k_opad, 64, outer_buffer, &outer_buffer_len, &outer_total_len);
+    sha256_update(outer_state, output, 32, outer_buffer, &outer_buffer_len, &outer_total_len);
+    sha256_final(outer_state, output, outer_buffer, outer_buffer_len, outer_total_len);
+}
+
+// Character set for brute force
+__device__ const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+#define CHARSET_SIZE 62
+
+__device__ void generate_key(unsigned long long index, int length, char* key) {
+    for (int i = length - 1; i >= 0; i--) {
+        key[i] = charset[index % CHARSET_SIZE];
+        index /= CHARSET_SIZE;
+    }
+    key[length] = '\0';
+}
+
+__global__ void crack_jwt_kernel(const unsigned char* target, const char* payload, int payload_len, 
+                                int key_length, unsigned long long start_index, 
+                                unsigned long long num_keys, int* found, char* result) {
+    unsigned long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= num_keys) return;
+    
+    char test_key[MAX_KEY_LENGTH + 1];
     unsigned char hash[32];
     
-    // Generate test key based on thread index
-    sprintf(test_key, "key%d", idx);
+    // Generate test key
+    generate_key(start_index + idx, key_length, test_key);
     
     // Compute HMAC
-    hmac_sha256(test_key, strlen(test_key), payload, payload_len, hash);
+    hmac_sha256(test_key, key_length, payload, payload_len, hash);
     
-    // Compare with target (simplified)
+    // Compare with target
     bool match = true;
     for (int i = 0; i < 32; i++) {
         if (hash[i] != target[i]) {
@@ -123,7 +214,7 @@ __global__ void crack_jwt_kernel(const char* target, const char* payload, int pa
         }
     }
     
-    if (match) {
+    if (match && atomicCAS(found, 0, 1) == 0) {
         strcpy(result, test_key);
     }
 }
